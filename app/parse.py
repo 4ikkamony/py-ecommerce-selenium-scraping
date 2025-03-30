@@ -230,8 +230,6 @@ def get_all_products(headless: bool = True) -> None:
             except Exception as e:
                 print(e)
 
-    driver.quit()
-
 
 if __name__ == "__main__":
     get_all_products(headless=True)
