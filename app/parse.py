@@ -1,171 +1,237 @@
-import time
-from dataclasses import dataclass
+import csv
+import json
+from time import sleep
+from types import TracebackType
 from urllib.parse import urljoin
+from typing import Optional, Type
+from dataclasses import dataclass, fields
 
-import requests
+from tqdm import tqdm
+from bs4.element import Tag
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common import NoSuchElementException, WebDriverException, TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
-from webdriver_manager.firefox import GeckoDriverManager
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.support import expected_conditions as ec
-from selenium.webdriver.support.select import Select
 
 
 BASE_URL = "https://webscraper.io/"
 HOME_URL = urljoin(BASE_URL, "test-sites/e-commerce/more/")
-COMPUTERS_URL = urljoin(HOME_URL, "computers")
-LAPTOPS_URL = urljoin(HOME_URL, "computers/laptops")
-TABLETS_URL = urljoin(HOME_URL, "computers/tablets")
-PHONES_URL = urljoin(HOME_URL, "phones")
-TOUCH_URL = urljoin(HOME_URL, "phones/touch")
+COMPUTER_URL = urljoin(BASE_URL, "/test-sites/e-commerce/more/computers/")
+LAPTOP_URL = urljoin(BASE_URL, "/test-sites/e-commerce/more/computers/laptops")
+TABLET_URL = urljoin(BASE_URL, "/test-sites/e-commerce/more/computers/tablets")
+PHONE_URL = urljoin(BASE_URL, "/test-sites/e-commerce/more/phones/")
+TOUCH_URL = urljoin(BASE_URL, "/test-sites/e-commerce/more/phones/touch")
+
+
+URL_AND_CSV_PATH_MAPPING = {
+    "home": ["home.csv", HOME_URL],
+    "computers": ["computers.csv", COMPUTER_URL],
+    "laptops": ["laptops.csv", LAPTOP_URL],
+    "tablets": ["tablets.csv", TABLET_URL],
+    "phones": ["phones.csv", PHONE_URL],
+    "touch": ["touch.csv", TOUCH_URL],
+}
 
 
 @dataclass
-class ProductDTO:
+class Product:
     title: str
     description: str
     price: float
     rating: int
     num_of_reviews: int
+    additional_info: dict
 
 
-def get_all_products() -> None:
-    pass
+class FirefoxWebDriverContextManager:
+    def __init__(self, headless: bool = True) -> None:
+        self.headless: bool = headless
+        self.driver: Optional[webdriver.Firefox] = None
+
+    def __enter__(self) -> webdriver.Firefox:
+        options = webdriver.FirefoxOptions()
+        if self.headless:
+            options.add_argument("-headless")
+        self.driver = webdriver.Firefox(options=options)
+        return self.driver
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType]
+    ) -> None:
+        self.driver.quit()
 
 
-def get_driver(headless: bool = False):
-    options = webdriver.FirefoxOptions()
-    if headless:
-        options.add_argument("--headless")
-    options.add_argument("-profile")
-    options.add_argument("/home/chikkamony/snap/firefox/common/.mozilla/firefox/frl4mbt9.selenium")
+def get_element(
+        by: By, value: str, context: WebDriver | WebElement
+) -> Optional[WebElement]:
+    try:
+        element = context.find_element(by, value)
+        return element
+    except NoSuchElementException:
+        return None
 
-    return webdriver.Firefox(options=options)
+
+def click_banner_cookie(driver: WebDriver) -> None:
+    cookie_container = get_element(
+        by=By.CLASS_NAME, value="acceptContainer", context=driver
+    )
+
+    if cookie_container:
+        button_cookie = cookie_container.find_element(By.TAG_NAME, "button")
+        WebDriverWait(driver, 0.5).until(
+            ec.element_to_be_clickable(button_cookie)
+        )
+        button_cookie.click()
 
 
-def get_product_detail(driver: webdriver.Firefox, product_links: list) -> list[ProductDTO]:
-    product_data: list[ProductDTO] = []
+def click_more_button(driver: WebDriver) -> None:
+    more = get_element(
+        context=driver, by=By.CLASS_NAME, value="ecomerce-items-scroll-more"
+    )
+    while more and more.is_displayed():
+        more.click()
+        sleep(0.1)
 
-    for link in product_links:
-        driver.get(link)
-        wait = WebDriverWait(driver, timeout=0.1)
-        try:
-            print(link)
-            product_name = wait.until(ec.presence_of_element_located(
-                (By.CSS_SELECTOR, "h4.title.card-title"))
-            ).text.strip()
-            print(product_name)
-            product_description = driver.find_element(
-                By.CSS_SELECTOR, "p.description.card-text"
-            ).text.strip()
-            print(product_description)
-            product_num_of_reviews = int(
-                driver.find_element(By.CSS_SELECTOR, "p.review-count").text.strip().split()[0]
+
+def get_hdd_price(elem: WebElement, driver: WebDriver) -> dict[str, float]:
+    hdd_price = {}
+
+    buttons = elem.find_elements(By.TAG_NAME, "button")
+
+    for button in buttons:
+        if not button.get_property("disabled"):
+            button.click()
+            hdd = button.get_property("value")
+            price = round(
+                float(
+                    driver.find_element(
+                        By.CLASS_NAME, "price"
+                    ).text.replace("$", "")
+                ),
+                2
             )
-            print(product_num_of_reviews)
-            product_rating = len(driver.find_elements(By.CSS_SELECTOR, "span.ws-icon.ws-icon-star"))
-            print(product_rating)
+            hdd_price[hdd] = price
 
+    return hdd_price
+
+
+def get_product_color(elem: WebElement) -> list[str]:
+    colors = []
+    items = elem.find_elements(By.CLASS_NAME, "dropdown-item")
+
+    for item in items[1:]:
+        colors.append(item.get_property("value"))
+
+    return colors
+
+
+def get_additional_info(product: Tag, driver: WebDriver) -> dict:
+    url = urljoin(BASE_URL, product.select_one(".title")["href"])
+    additional_info = {}
+
+    driver.get(url)
+
+    WebDriverWait(driver, 10).until(
+        ec.presence_of_element_located((By.CLASS_NAME, "card-body"))
+    )
+
+    click_banner_cookie(driver)
+
+    product_body = driver.find_element(By.CLASS_NAME, "card-body")
+
+    hdd_elem = get_element(
+        by=By.CLASS_NAME,
+        value="swatches",
+        context=product_body
+    )
+    if hdd_elem:
+        hdd_price = get_hdd_price(hdd_elem, driver)
+        additional_info["hdd"] = hdd_price
+
+    color_elem = get_element(
+        by=By.CLASS_NAME,
+        value="dropdown",
+        context=product_body
+    )
+    if color_elem:
+        colors = get_product_color(color_elem)
+        additional_info["colors"] = colors
+
+    return additional_info
+
+
+def parse_product(product: Tag, driver: WebDriver) -> Product:
+    data = {
+        "title": product.select_one(".title")["title"],
+        "description": product.select_one(".description").text,
+        "price": round(
+            float(product.select_one(".price").text.replace("$", "")),
+            2
+        ),
+        "rating": int(product.select_one(".review-count").text.split()[0]),
+        "num_of_reviews": len(product.select(".ws-icon-star")),
+        "additional_info": get_additional_info(product, driver)
+    }
+    return Product(**data)
+
+
+def parse_page(
+    driver: webdriver.Firefox,
+    page_url: str,
+    name_process: str
+) -> list[Product]:
+
+    driver.get(page_url)
+    click_banner_cookie(driver)
+    click_more_button(driver)
+    html = driver.page_source
+
+    soup = BeautifulSoup(html, "html.parser")
+    products_soup = soup.select(".card-body")
+
+    products_list = []
+
+    for product in tqdm(
+            products_soup,
+            desc=f"Progress: {name_process.title()}"
+    ):
+        products_list.append(parse_product(product, driver))
+
+    return products_list
+
+
+def save_product_to_csv(file_name: str, objects: list[Product]) -> None:
+    with open(file_name, "w", encoding="UTF-8", newline="") as f:
+        field_names = [field.name for field in fields(objects[0])]
+        writer = csv.writer(f)
+        writer.writerow(field_names)
+
+        for obj in objects:
+            row = [getattr(obj, field) for field in field_names]
+            row[-1] = json.dumps(row[-1])
+            writer.writerow(row)
+
+
+def get_all_products(headless: bool = True) -> None:
+    with FirefoxWebDriverContextManager(headless) as driver:
+        for name, value in URL_AND_CSV_PATH_MAPPING.items():
             try:
-                hdd_buttons = driver.find_elements(By.CSS_SELECTOR, "div.swatches button.swatch")
+                file_name = value[0]
+                url = value[1]
+                products = parse_page(driver, url, name)
+                save_product_to_csv(file_name, products)
+            except Exception as e:
+                print(e)
 
-                product_prices = {}
-                for button in hdd_buttons:
-                    hdd_size = button.get_attribute("value")
-                    driver.execute_script(
-                        "arguments[0].click();",
-                        button
-                    )
-                    time.sleep(0.1)
-                    price = round(float(wait.until(ec.presence_of_element_located(
-                        (By.CSS_SELECTOR, "h4.price")
-                    )).text.strip().replace("$", "")), 2)
-                    product_prices[hdd_size] = price
-            except NoSuchElementException as e:
-                product_prices = {}
-            print(product_prices)
-
-            try:
-                color_dropdown = driver.find_element(By.CSS_SELECTOR, "select[aria-label='color']")
-                color_options = color_dropdown.find_elements(By.TAG_NAME, "option")
-                color_values = []
-                for color_option in color_options:
-                    color_value = color_option.get_attribute("value")
-                    if color_value:
-                        try:
-                            Select(color_dropdown).select_by_value(color_value)
-                            time.sleep(1)
-                        except NoSuchElementException as e:
-                            print(e)
-
-            except NoSuchElementException as e:
-                pass
-
-        except (TimeoutException, NoSuchElementException) as e:
-            print(e)
-    return product_data
-
-
-def main(url: str, headless: bool = False) -> None:
-    driver = get_driver(headless)
-    scroll_and_load_all_products(driver, url)
-    links = get_all_products_links(driver)
-    get_product_detail(driver, links)
-    print(len(links))
     driver.quit()
 
 
-def scroll_and_load_all_products(driver: webdriver.Firefox, url: str) -> None:
-    driver.get(url)
-    wait = WebDriverWait(driver=driver, timeout=2)
-    try:
-        cookie_button = wait.until(ec.element_to_be_clickable((By.CSS_SELECTOR, "button.acceptCookies")))
-        cookie_button.click()
-        time.sleep(0.1)
-    except (TimeoutException, NoSuchElementException):
-        pass
-
-    while True:
-        try:
-            more_button = wait.until(ec.presence_of_element_located(
-                (By.CSS_SELECTOR, "a.ecomerce-items-scroll-more"))
-            )
-            driver.execute_script(
-                "arguments[0].scrollIntoView();",
-                more_button
-            )
-            time.sleep(0.1)
-            more_button.click()
-            time.sleep(0.1)
-
-        except WebDriverException as e:
-            print(str(e))
-            break
-    return None
-
-
-def get_all_products_links(driver: webdriver.Firefox):
-    products_links = []
-
-    try:
-        WebDriverWait(driver=driver, timeout=1).until(
-            ec.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, "div.card.thumbnail")
-            )
-        )
-        product_elements = driver.find_elements(By.CSS_SELECTOR, "div.card.thumbnail a.title")
-        for element in product_elements:
-            product_link = element.get_attribute("href")
-            if product_link:
-                products_links.append(product_link)
-    except (TimeoutException, NoSuchElementException) as e:
-        print(e)
-        pass
-
-    return products_links
-
-
 if __name__ == "__main__":
-    main(headless=False, url=TOUCH_URL)
+    get_all_products(headless=True)
